@@ -109,3 +109,27 @@ fn ai_worker_stream_parser_updates_progress() {
     assert!(parse_worker_line(line_finish, &progress));
     assert_eq!(progress.done.load(Ordering::Relaxed), 1200);
 }
+
+#[test]
+fn ai_apply_imports_media_and_places_on_timeline() {
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({ "name": "Sequence 1", "video": 2, "audio": 2 })).unwrap();
+
+    let test_mov = "/home/kaua/Videos/scrp/teste_worker_mov.mov";
+    if std::path::Path::new(test_mov).exists() {
+        let res = s.execute("ai.apply", json!({
+            "path": test_mov,
+            "track": "V2"
+        })).unwrap();
+
+        assert_eq!(res["status"], "applied");
+        assert_eq!(res["track"], "V2");
+        assert!(res["importedItem"].as_u64().is_some());
+
+        let q = s.active_sequence().unwrap();
+        let v2 = &q.video_tracks[1];
+        assert_eq!(v2.items.len(), 1);
+        assert_eq!(v2.items[0].item.0, res["importedItem"].as_u64().unwrap());
+    }
+}
+

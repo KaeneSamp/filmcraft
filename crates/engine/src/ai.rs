@@ -5,10 +5,12 @@
 //! - `ai.run`: dispatches an AI job in the background (or synchronously when `wait: true`).
 //! - `ai.status`: retrieves real-time progress metrics (done, total, ETA, FPS, status).
 //! - `ai.cancel`: cleanly requests abort of a running AI job.
+//! - `ai.apply`: imports generated media into the project and places transparent clips on the timeline.
 //!
 //! Output events stream through `filmcraft_export::Progress`, feeding both the UI panel and the
 //! global jobs queue (`jobs.list`).
 
+use std::io::BufRead;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +18,7 @@ use filmcraft_project::{ClipId, TrackKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, u64_p};
 use crate::{Result, Session};
 
 /// Parameter definition for an AI tool.
@@ -73,6 +75,44 @@ pub fn available_tools() -> Vec<AiToolInfo> {
     ]
 }
 
+/// Locate AI worker script and NCNN Vulkan model assets on disk.
+pub fn find_ai_assets() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let mut search_roots = Vec::new();
+    if let Some(env_d) = std::env::var_os("FILMCRAFT_AI_DIR") {
+        search_roots.push(std::path::PathBuf::from(env_d));
+    }
+    search_roots.push(std::path::PathBuf::from("/home/kaua/Projetos/filmcraft"));
+    if let Ok(cur) = std::env::current_dir() {
+        search_roots.push(cur);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = exe.parent() {
+            search_roots.push(p.to_path_buf());
+            search_roots.push(p.join(".."));
+        }
+    }
+    if let Some(data) = crate::autosave::default_data_dir() {
+        search_roots.push(data);
+    }
+
+    for base in &search_roots {
+        let script = base.join("crates/engine/scripts/rvm_vulkan_worker.py");
+        let param = base.join("assets/ai/models/rvm_mobilenetv3.ncnn.param");
+        let bin = base.join("assets/ai/models/rvm_mobilenetv3.ncnn.bin");
+        if script.exists() && param.exists() && bin.exists() {
+            return Some((script, param, bin));
+        }
+
+        let script2 = base.join("scripts/rvm_vulkan_worker.py");
+        let param2 = base.join("models/rvm_mobilenetv3.ncnn.param");
+        let bin2 = base.join("models/rvm_mobilenetv3.ncnn.bin");
+        if script2.exists() && param2.exists() && bin2.exists() {
+            return Some((script2, param2, bin2));
+        }
+    }
+    None
+}
+
 /// The command specs registered in the Engine.
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
@@ -91,7 +131,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             label: "Run AI Tool",
             menu: &["Clip", "AI"],
             shortcut: None,
-            params: r#"{"tool":str,"clip":id?,"wait":bool=false,"smoothing":f64=0.7,"feather":f64=2.0,"greenSuppression":bool=true,"mock":bool=false,"mockFrames":n=100}"#,
+            params: r#"{"tool":str,"clip":id?,"wait":bool=false,"autoPlace":bool=true,"smoothing":f64=0.7,"feather":f64=2.0,"greenSuppression":bool=true,"mock":bool=false,"mockFrames":n=100}"#,
             enabled: always,
             run: run_tool,
             journal: true,
@@ -114,6 +154,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             params: r#"{"job":id}"#,
             enabled: always,
             run: cancel_tool,
+            journal: true,
+        },
+        CommandSpec {
+            id: "ai.apply",
+            label: "Apply AI Result",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"path":str,"clip":id?,"track":str?}"#,
+            enabled: has_seq,
+            run: apply_tool,
             journal: true,
         },
     ]
@@ -150,17 +200,57 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let smoothing = f64_p(p, "smoothing").unwrap_or(0.70).clamp(0.0, 1.0);
     let feather = f64_p(p, "feather").unwrap_or(2.0).clamp(0.0, 8.0);
     let green_suppr = bool_p(p, "greenSuppression").unwrap_or(true);
-    let mock = bool_p(p, "mock").unwrap_or(false);
-    let mock_frames = u64_p(p, "mockFrames").unwrap_or(60).max(1);
-    let wait = bool_p(p, "wait").unwrap_or(false);
-
-    // Find the clip if specified or from selection
+    // Find the clip if specified or from active sequence selection
     let clip_id = p.get("clip").and_then(Value::as_u64).map(ClipId).or_else(|| {
         let q = s.active_sequence()?;
         s.state.selection.iter().copied().find(|c| {
             q.find_item(*c).is_some_and(|(t, _)| q.track(t).is_some_and(|trk| trk.kind == TrackKind::Video))
         })
     });
+
+    let mock = bool_p(p, "mock").unwrap_or(false) || (clip_id.is_none() && str_p(p, "input").is_none());
+    let mock_frames = u64_p(p, "mockFrames").unwrap_or(60).max(1);
+    let wait = bool_p(p, "wait").unwrap_or(false);
+    let auto_place = bool_p(p, "autoPlace").unwrap_or(true);
+    let fps = f64_p(p, "fps").unwrap_or(30.0);
+    let res = str_p(p, "res").unwrap_or("480p").to_string();
+
+    let (input_path, source_in_sec, duration_sec, output_path, detected_frames, is_mock) = if let Some(inp) = str_p(p, "input") {
+        let dur = f64_p(p, "duration").unwrap_or(2.0);
+        let start = f64_p(p, "start").unwrap_or(0.0);
+        let out = str_p(p, "output").map(str::to_string).unwrap_or_else(|| {
+            let pb = std::path::PathBuf::from(inp);
+            let stem = pb.file_stem().and_then(|s| s.to_str()).unwrap_or("matte");
+            let dir = pb.parent().unwrap_or(std::path::Path::new("."));
+            dir.join(format!("{stem}_ai_matte.mov")).to_string_lossy().to_string()
+        });
+        (inp.to_string(), start, dur, out, (dur * fps) as u64, mock)
+    } else if let Some(cid) = clip_id {
+        let q = s.active_sequence().ok_or_else(|| bad("ai.run", "no active sequence"))?;
+        let (_, it) = q.find_item(cid).ok_or_else(|| bad("ai.run", "selected clip not found in sequence"))?;
+        let (_, media_clip, _) = s.project.resolve_media(it.item).ok_or_else(|| bad("ai.run", "cannot resolve media for clip"))?;
+        match &media_clip.media {
+            filmcraft_project::MediaRef::File { path } if !mock => {
+                let start_sec = it.source_in.seconds();
+                let dur_sec = it.duration.seconds();
+                let out = str_p(p, "output").map(str::to_string).unwrap_or_else(|| {
+                    let pb = std::path::PathBuf::from(path);
+                    let stem = pb.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+                    let dir = pb.parent().unwrap_or(std::path::Path::new("."));
+                    dir.join(format!("{stem}_ai_matte.mov")).to_string_lossy().to_string()
+                });
+                (path.clone(), start_sec, dur_sec, out, (dur_sec * fps) as u64, false)
+            }
+            _ => {
+                // If it's a generator (demo footage) or mock requested, fall back to simulation
+                ("mock_demo.mp4".to_string(), 0.0, 2.0, "mock_output.mov".to_string(), mock_frames, true)
+            }
+        }
+    } else if mock {
+        ("mock_webcam.mp4".to_string(), 0.0, 2.0, "mock_output.mov".to_string(), mock_frames, true)
+    } else {
+        return Err(bad("ai.run", "select a video clip on timeline or specify `input`"));
+    };
 
     let tool_info = available_tools()
         .into_iter()
@@ -183,58 +273,150 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let prog_worker = progress.clone();
     let res_worker = result.clone();
     let tool_name = tool_info.name.clone();
+    let runner_out_path = output_path.clone();
 
     let runner = move || {
         let t0 = web_time::Instant::now();
-        prog_worker.total.store(mock_frames, Ordering::Relaxed);
+        prog_worker.total.store(detected_frames.max(1), Ordering::Relaxed);
 
-        let mut done = 0u64;
-        let mut err = None;
-
-        for frame in 1..=mock_frames {
-            if prog_worker.cancel.load(Ordering::Relaxed) {
-                err = Some("stopped".to_string());
-                break;
+        if is_mock {
+            let mut done = 0u64;
+            let mut err = None;
+            for frame in 1..=mock_frames {
+                if prog_worker.cancel.load(Ordering::Relaxed) {
+                    err = Some("stopped".to_string());
+                    break;
+                }
+                if !wait {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                done = frame;
+                prog_worker.done.store(done, Ordering::Relaxed);
+                let elapsed = t0.elapsed().as_secs_f64().max(0.001);
+                let current_fps = done as f64 / elapsed;
+                *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!(
+                    "{}: frame {}/{} ({:.1} FPS)",
+                    tool_name, done, mock_frames, current_fps
+                );
             }
-
-            // Simulate frame processing tick or IPC reading
-            if mock {
-                std::thread::sleep(std::time::Duration::from_millis(15));
-            }
-
-            done = frame;
-            prog_worker.done.store(done, Ordering::Relaxed);
-
-            let elapsed = t0.elapsed().as_secs_f64().max(0.001);
-            let fps = done as f64 / elapsed;
-            *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!(
-                "{}: frame {}/{} ({:.1} FPS)",
-                tool_name, done, mock_frames, fps
-            );
+            let secs = t0.elapsed().as_secs_f64();
+            let final_fps = done as f64 / secs.max(0.001);
+            let final_report = match err {
+                Some(msg) => {
+                    *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!("Cancelled: {msg}");
+                    Err(msg)
+                }
+                None => {
+                    *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!(
+                        "Finished: processed {} frames in {:.2}s ({:.1} FPS)",
+                        done, secs, final_fps
+                    );
+                    Ok(filmcraft_export::Report {
+                        path: runner_out_path.clone(),
+                        frames: done,
+                        seconds: secs,
+                        bytes: 0,
+                        render_fps: final_fps,
+                        extra_files: Vec::new(),
+                    })
+                }
+            };
+            *res_worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(final_report);
+            prog_worker.finished.store(true, Ordering::Relaxed);
+            return;
         }
 
-        let secs = t0.elapsed().as_secs_f64();
-        let fps = done as f64 / secs.max(0.001);
-
-        let final_report = match err {
-            Some(msg) => {
-                *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!("Cancelled: {msg}");
-                Err(msg)
-            }
+        // Real execution with NCNN Vulkan worker
+        let (script, param, bin) = match find_ai_assets() {
+            Some(assets) => assets,
             None => {
-                *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!(
-                    "Finished: processed {} frames in {:.2}s ({:.1} FPS)",
-                    done, secs, fps
-                );
+                let err_msg = "AI assets not found (rvm_vulkan_worker.py or ncnn models)".to_string();
+                *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = err_msg.clone();
+                *res_worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(err_msg));
+                prog_worker.finished.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = "Iniciando pipeline Vulkan GPU...".to_string();
+
+        let mut cmd = std::process::Command::new("nice");
+        cmd.args([
+            "-n", "19",
+            "ionice", "-c", "3",
+            "uv", "run",
+            "--with", "opencv-python-headless",
+            "--with", "numpy",
+            "--with", "ncnn",
+            script.to_str().unwrap(),
+            "-i", &input_path,
+            "-o", &runner_out_path,
+            "--param", param.to_str().unwrap(),
+            "--model", bin.to_str().unwrap(),
+            "-ss", &format!("{source_in_sec:.3}"),
+            "-t", &format!("{duration_sec:.3}"),
+            "--smoothing", &format!("{smoothing:.2}"),
+            "--feather", &format!("{feather:.1}"),
+            "--fps", &format!("{fps:.1}"),
+            "--res", &res,
+        ]);
+        if !green_suppr {
+            cmd.arg("--no-green-suppression");
+        }
+
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = format!("Failed to spawn AI worker process: {e}");
+                *prog_worker.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = err_msg.clone();
+                *res_worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(err_msg));
+                prog_worker.finished.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::io::BufReader::new(stdout);
+        let mut last_done = 0u64;
+        let mut cancelled = false;
+
+        for line_res in reader.lines() {
+            if prog_worker.cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                cancelled = true;
+                break;
+            }
+            if let Ok(line) = line_res {
+                parse_worker_line(&line, &prog_worker);
+                last_done = prog_worker.done.load(Ordering::Relaxed);
+            }
+        }
+
+        let status = child.wait();
+        let secs = t0.elapsed().as_secs_f64();
+        let final_fps = last_done as f64 / secs.max(0.001);
+
+        let final_report = if cancelled {
+            Err("Cancelled by user".to_string())
+        } else if let Ok(st) = status {
+            if st.success() {
+                let bytes = std::fs::metadata(&runner_out_path).map(|m| m.len()).unwrap_or(0);
                 Ok(filmcraft_export::Report {
-                    path: String::new(),
-                    frames: done,
+                    path: runner_out_path.clone(),
+                    frames: last_done,
                     seconds: secs,
-                    bytes: 0,
-                    render_fps: fps,
+                    bytes,
+                    render_fps: final_fps,
                     extra_files: Vec::new(),
                 })
+            } else {
+                Err(format!("AI worker exited with code {:?}", st.code()))
             }
+        } else {
+            Err("Failed to wait on worker process".to_string())
         };
 
         *res_worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(final_report);
@@ -247,6 +429,17 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
 
     if wait || cfg!(target_arch = "wasm32") {
         guarded_runner();
+        if auto_place {
+            let res = result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(Ok(rep)) = res {
+                if !rep.path.is_empty() && std::path::Path::new(&rep.path).exists() {
+                    let _ = s.execute("ai.apply", json!({
+                        "path": rep.path,
+                        "clip": clip_id.map(|c| c.0),
+                    }));
+                }
+            }
+        }
     } else {
         std::thread::Builder::new()
             .name(format!("ai-worker-{id}"))
@@ -258,7 +451,8 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
         "job": id,
         "tool": tool_id,
         "clip": clip_id.map(|c| c.0),
-        "total": mock_frames,
+        "total": detected_frames.max(1),
+        "outputPath": output_path,
         "smoothing": smoothing,
         "feather": feather,
         "greenSuppression": green_suppr,
@@ -304,5 +498,78 @@ fn cancel_tool(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "job": id,
         "cancelled": true
+    }))
+}
+
+fn apply_tool(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_p(p, "path").ok_or_else(|| bad("ai.apply", "need `path`"))?;
+    let clip_id = u64_p(p, "clip").map(ClipId).or_else(|| {
+        let q = s.active_sequence()?;
+        s.state.selection.iter().copied().find(|c| {
+            q.find_item(*c).is_some_and(|(t, _)| q.track(t).is_some_and(|trk| trk.kind == TrackKind::Video))
+        })
+    });
+
+    // 1. Import media file into media pool
+    let import_res = s.execute("file.import", json!({ "paths": [path] }))?;
+    let items = import_res.get("items").and_then(Value::as_array).ok_or_else(|| bad("ai.apply", "import returned no items"))?;
+    let item_id = items.first().and_then(Value::as_u64).ok_or_else(|| bad("ai.apply", "no item id from import"))?;
+
+    // 2. Query timing and track from the original clip if present
+    let (start, source_in, duration, track_choice, effects_to_copy) = if let Some(cid) = clip_id {
+        let q = s.active_sequence().ok_or_else(|| bad("ai.apply", "no active sequence"))?;
+        let (track_id, it) = q.find_item(cid).ok_or_else(|| bad("ai.apply", "original clip not found"))?;
+        let next_track = if q.video_tracks.len() > 1 {
+            let current_idx = q.video_tracks.iter().position(|t| t.id == track_id).unwrap_or(0);
+            if current_idx + 1 < q.video_tracks.len() {
+                format!("V{}", current_idx + 2)
+            } else {
+                "new".to_string()
+            }
+        } else {
+            "new".to_string()
+        };
+        (it.start, it.source_in, it.duration, next_track, it.effects.clone())
+    } else {
+        let q = s.active_sequence().ok_or_else(|| bad("ai.apply", "no active sequence"))?;
+        let track_choice = if q.video_tracks.len() > 1 { "V2".to_string() } else { "new".to_string() };
+        (s.playhead(), filmcraft_time::Tick::ZERO, filmcraft_time::Tick::from_seconds_f64(5.0), track_choice, Vec::new())
+    };
+
+    let target_track = str_p(p, "track").map(str::to_string).unwrap_or(track_choice);
+
+    // 3. Place clip on timeline
+    let place_res = s.execute("timeline.place", json!({
+        "item": item_id,
+        "track": target_track,
+        "time": start.0,
+        "sourceIn": source_in.0,
+        "duration": duration.0,
+        "video": true,
+        "audio": false,
+        "insert": false,
+    }))?;
+
+    // 4. Inherit effects (motion position & scale) if available
+    if !effects_to_copy.is_empty() {
+        if let Some(placed_clip_id) = place_res.get("clip").and_then(Value::as_u64).map(ClipId).or_else(|| {
+            place_res.get("clips").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_u64).map(ClipId)
+        }) {
+            if let Some(seq_id) = s.state.active_sequence {
+                if let Some(q) = std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq_id) {
+                    if let Some((_, placed_item)) = q.find_item_mut(placed_clip_id) {
+                        placed_item.effects = effects_to_copy;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "status": "applied",
+        "importedItem": item_id,
+        "track": target_track,
+        "path": path,
+        "placed": place_res
     }))
 }

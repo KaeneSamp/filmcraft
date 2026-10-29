@@ -125,6 +125,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.ai.running_job = None;
         match report_res {
             Some(Ok(rep)) => {
+                if !rep.path.is_empty() {
+                    let clip_opt = active_clip.as_ref().map(|(c, _, _, _)| c.0);
+                    let _ = app.session.execute("ai.apply", json!({
+                        "path": rep.path,
+                        "clip": clip_opt,
+                    }));
+                }
                 app.ui.status = format!("IA concluída: {} quadros processados em {:.1}s!", rep.frames, rep.seconds);
                 app.ui.ai.status_message = format!("Concluído: {} quadros em {:.1}s ({:.1} FPS)", rep.frames, rep.seconds, rep.render_fps);
             }
@@ -432,20 +439,25 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             auto.add("ai.run", resp.rect, "Executar IA");
 
             if resp.clicked() {
+                let has_assets = filmcraft_engine::ai::find_ai_assets().is_some();
                 let params = json!({
                     "tool": app.ui.ai.selected_tool,
                     "clip": active_clip.as_ref().map(|(c, _, _, _)| c.0),
                     "smoothing": app.ui.ai.matting_smoothing,
                     "feather": app.ui.ai.matting_feather,
                     "greenSuppression": app.ui.ai.matting_green_suppression,
-                    "mock": true,
+                    "mock": !has_assets,
                     "mockFrames": 120,
                 });
                 match app.session.execute("ai.run", params) {
                     Ok(r) => {
                         if let Some(id) = r.get("job").and_then(serde_json::Value::as_u64) {
                             app.ui.ai.running_job = Some(id);
-                            app.ui.status = "Iniciando processamento com IA Vulkan...".to_string();
+                            app.ui.status = if has_assets {
+                                "Iniciando processamento com IA Vulkan (GPU)...".to_string()
+                            } else {
+                                "Iniciando simulação de teste...".to_string()
+                            };
                         }
                     }
                     Err(e) => {
