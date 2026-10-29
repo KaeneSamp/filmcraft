@@ -133,3 +133,23 @@ fn ai_apply_imports_media_and_places_on_timeline() {
     }
 }
 
+#[test]
+fn ai_preview_generates_frame_result() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+
+    let seq = s.execute("sequence.inspect", json!({})).unwrap();
+    let first_clip = seq["video"][0]["items"][0]["clip"].as_u64().unwrap();
+
+    let res = s.execute("ai.preview", json!({
+        "clip": first_clip,
+        "time": 0.5,
+        "feather": 2.0,
+        "greenSuppression": true,
+    })).unwrap();
+
+    assert_eq!(res["ok"], true);
+    assert!(res["path"].as_str().is_some());
+    assert_eq!(res["clip"], first_clip);
+}
+

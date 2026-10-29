@@ -133,6 +133,63 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     if let Some(tex) = shown {
         ui.painter().image(tex, pic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     }
+    // AI Studio Real-time Cutout Preview Overlay (Program Monitor)
+    if which == Which::Program && app.ui.ai.preview_overlay_program {
+        if let Some(ref path) = app.ui.ai.preview_path {
+            if let Some(preview_tex) = crate::panels::ai_hub::get_ai_preview_texture(&ctx, path) {
+                let target_rect = if let Some(seq_id) = app.session.state.active_sequence {
+                    if let Some(seq) = app.session.project.sequence(seq_id) {
+                        if let Some((_cid, item, _, _)) = crate::panels::ai_hub::selected_video_clip(app) {
+                            let mt = filmcraft_time::Tick(time.0.saturating_sub(item.start.0)) + item.source_in;
+                            let src_size = filmcraft_render::source_size(&app.session.project, item.item).unwrap_or(frame_size);
+                            let src_par = filmcraft_render::source_par(&app.session.project, item.item);
+                            let m = filmcraft_render::motion_matrix(seq, &item, src_size, src_par, mt);
+
+                            let p0 = m.apply(filmcraft_geom::Vec2::new(0.0, 0.0));
+                            let p1 = m.apply(filmcraft_geom::Vec2::new(src_size.0 as f64, src_size.1 as f64));
+                            let sw = frame_size.0 as f32;
+                            let sh = frame_size.1 as f32;
+                            let to_screen = |v: filmcraft_geom::Vec2| -> egui::Pos2 {
+                                egui::pos2(
+                                    pic.min.x + (v.x as f32 / sw) * pic.width(),
+                                    pic.min.y + (v.y as f32 / sh) * pic.height(),
+                                )
+                            };
+                            let min_x = p0.x.min(p1.x);
+                            let max_x = p0.x.max(p1.x);
+                            let min_y = p0.y.min(p1.y);
+                            let max_y = p0.y.max(p1.y);
+                            egui::Rect::from_min_max(
+                                to_screen(filmcraft_geom::Vec2::new(min_x, min_y)),
+                                to_screen(filmcraft_geom::Vec2::new(max_x, max_y)),
+                            )
+                        } else {
+                            pic
+                        }
+                    } else {
+                        pic
+                    }
+                } else {
+                    pic
+                };
+
+                ui.painter().image(
+                    preview_tex.id(),
+                    target_rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+
+                // Subtle indicator border showing the live AI cutout position
+                ui.painter().rect_stroke(
+                    target_rect,
+                    2.0,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x40, 0xc0, 0x57, 180)),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+    }
     if let Some(ra) = ref_area {
         // the reference frame (CPU path)
         let rf = rate.frame_at(Tick(mv.compare_ref.unwrap_or(time.0)));

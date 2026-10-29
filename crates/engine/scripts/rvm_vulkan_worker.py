@@ -343,10 +343,143 @@ def run_worker(
         "status": f"Concluído: {final_frames} quadros em {total_el:.1f}s ({final_fps:.1f} FPS)"
     })
 
+def run_preview_frame(
+    input_video: str,
+    output_png: str,
+    param_path: str,
+    model_path: str,
+    preview_time: float = 0.0,
+    feather: float = 2.0,
+    green_suppression: bool = True,
+    resolution: str = "480p",
+):
+    import cv2
+    import ncnn
+
+    t0 = time.time()
+    # 1. Probe input video metadata
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json", input_video,
+    ]
+    meta = json.loads(subprocess.check_output(probe_cmd).decode())
+    orig_w = int(meta["streams"][0]["width"])
+    orig_h = int(meta["streams"][0]["height"])
+
+    # 2. Grab single frame at preview_time using ffmpeg
+    read_cmd = [
+        "ffmpeg", "-v", "error",
+        "-ss", str(max(preview_time, 0.0)),
+        "-i", input_video,
+        "-vframes", "1",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-"
+    ]
+    try:
+        raw = subprocess.check_output(read_cmd)
+        frame_orig = np.frombuffer(raw, dtype=np.uint8).reshape((orig_h, orig_w, 3))
+    except Exception as e:
+        emit({"type": "error", "message": f"Erro ao capturar frame com ffmpeg: {e}"})
+        sys.exit(1)
+
+    # 3. Init NCNN Vulkan
+    net = ncnn.Net()
+    net.opt.use_vulkan_compute = True
+    net.opt.num_threads = 4
+    net.load_param(param_path)
+    net.load_model(model_path)
+
+    if resolution == "480p":
+        inf_w, inf_h = 854, 480
+        target_size = 416
+    else:
+        inf_w, inf_h = orig_w, orig_h
+        target_size = 512
+
+    frame_inf = cv2.resize(frame_orig, (inf_w, inf_h), interpolation=cv2.INTER_LINEAR)
+    frame_rgb = cv2.cvtColor(frame_inf, cv2.COLOR_BGR2RGB)
+
+    h2 = int(round(inf_h * (target_size / inf_w) / 32)) * 32
+    w2 = target_size
+    norm_vals = [1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0]
+
+    r1 = ncnn.Mat(target_size // 2, h2 // 2, 16); r1.fill(0.0)
+    r2 = ncnn.Mat(target_size // 4, h2 // 4, 20); r2.fill(0.0)
+    r3 = ncnn.Mat(target_size // 8, h2 // 8, 40); r3.fill(0.0)
+    r4 = ncnn.Mat(target_size // 16, h2 // 16, 64); r4.fill(0.0)
+
+    in_pad = ncnn.Mat.from_pixels(frame_rgb, ncnn.Mat.PixelType.PIXEL_RGB, inf_w, inf_h)
+    in_small_pad = ncnn.Mat.from_pixels_resize(frame_rgb, ncnn.Mat.PixelType.PIXEL_RGB, inf_w, inf_h, w2, h2)
+    in_pad.substract_mean_normalize([], norm_vals)
+    in_small_pad.substract_mean_normalize([], norm_vals)
+
+    ex = net.create_extractor()
+    ex.input("in0", in_pad)
+    ex.input("in1", in_small_pad)
+    ex.input("in2", r1)
+    ex.input("in3", r2)
+    ex.input("in4", r3)
+    ex.input("in5", r4)
+
+    _, out_pha = ex.extract("out3")
+    raw_arr = np.array(out_pha)[0]
+    alpha_ai = 1.0 / (1.0 + np.exp(-raw_arr))
+
+    # Apply soft green suppression if enabled
+    if green_suppression:
+        hsv = cv2.cvtColor(frame_orig, cv2.COLOR_BGR2HSV)
+        is_green = cv2.inRange(hsv, (35, 55, 45), (90, 255, 255))
+        non_green = cv2.bitwise_not(is_green)
+        non_green_sm = cv2.resize(non_green, (214, 120), interpolation=cv2.INTER_NEAREST)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(non_green_sm)
+        best_label = 1
+        max_area = 0
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            cy = centroids[i][1]
+            if area > max_area and cy > 120 * 0.3:
+                max_area = area
+                best_label = i
+        chair_sm = (labels == best_label).astype(np.uint8) * 255
+        chair_solid = cv2.resize(chair_sm, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        chair_norm = cv2.GaussianBlur(chair_solid, (9, 9), 2.5).astype(np.float32) / 255.0
+        green_soft = cv2.GaussianBlur(is_green, (7, 7), 2.0).astype(np.float32) / 255.0
+        alpha_full = cv2.resize(alpha_ai, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        suppression_factor = np.clip(green_soft * (1.0 - chair_norm * 0.95), 0.0, 1.0)
+        alpha_final = alpha_full * (1.0 - suppression_factor * 0.96)
+    else:
+        alpha_final = cv2.resize(alpha_ai, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+    if feather > 0.0:
+        feather_k = int(round(feather)) * 2 + 1
+        alpha_final = cv2.GaussianBlur(alpha_final, (feather_k, feather_k), feather)
+
+    alpha_u8 = (np.clip(alpha_final, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    bgra = cv2.cvtColor(frame_orig, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = alpha_u8
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_png)), exist_ok=True)
+    cv2.imwrite(output_png, bgra)
+
+    el = time.time() - t0
+    emit({
+        "type": "preview_ready",
+        "path": output_png,
+        "time": preview_time,
+        "width": orig_w,
+        "height": orig_h,
+        "elapsed": round(el, 3),
+        "status": f"Prévia gerada em {el*1000:.0f}ms"
+    })
+
 def main():
     parser = argparse.ArgumentParser(description="FilmCraft AI Matting Worker")
     parser.add_argument("-i", "--input", required=True, help="Input video")
-    parser.add_argument("-o", "--output", required=True, help="Output ProRes 4444 .mov")
+    parser.add_argument("-o", "--output", required=True, help="Output file (ProRes .mov or Preview .png)")
     parser.add_argument("--param", required=True, help="NCNN .param file")
     parser.add_argument("--model", required=True, help="NCNN .bin file")
     parser.add_argument("-ss", "--start", default=None, help="Start time offset")
@@ -356,22 +489,35 @@ def main():
     parser.add_argument("--no-green-suppression", action="store_true", help="Disable green suppression")
     parser.add_argument("--fps", type=float, default=30.0, help="Target CFR frame rate")
     parser.add_argument("--res", default="480p", choices=["480p", "720p"], help="Inference resolution")
+    parser.add_argument("--preview-time", type=float, default=None, help="Run single-frame preview at seconds")
 
     args = parser.parse_args()
 
-    run_worker(
-        input_video=args.input,
-        output_mov=args.output,
-        param_path=args.param,
-        model_path=args.model,
-        start_time=args.start,
-        duration_sec=args.duration,
-        smoothing=args.smoothing,
-        feather=args.feather,
-        green_suppression=not args.no_green_suppression,
-        target_fps=args.fps,
-        resolution=args.res,
-    )
+    if args.preview_time is not None:
+        run_preview_frame(
+            input_video=args.input,
+            output_png=args.output,
+            param_path=args.param,
+            model_path=args.model,
+            preview_time=args.preview_time,
+            feather=args.feather,
+            green_suppression=not args.no_green_suppression,
+            resolution=args.res,
+        )
+    else:
+        run_worker(
+            input_video=args.input,
+            output_mov=args.output,
+            param_path=args.param,
+            model_path=args.model,
+            start_time=args.start,
+            duration_sec=args.duration,
+            smoothing=args.smoothing,
+            feather=args.feather,
+            green_suppression=not args.no_green_suppression,
+            target_fps=args.fps,
+            resolution=args.res,
+        )
 
 if __name__ == "__main__":
     main()

@@ -166,6 +166,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: apply_tool,
             journal: true,
         },
+        CommandSpec {
+            id: "ai.preview",
+            label: "Preview AI Cutout Frame",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"clip":id?,"time":f64?,"feather":f64=2.0,"greenSuppression":bool=true,"res":str="480p"}"#,
+            enabled: has_seq,
+            run: preview_tool,
+            journal: false,
+        },
     ]
 }
 
@@ -516,27 +526,16 @@ fn apply_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let item_id = items.first().and_then(Value::as_u64).ok_or_else(|| bad("ai.apply", "no item id from import"))?;
 
     // 2. Query timing and track from the original clip if present
-    let (start, source_in, duration, track_choice, effects_to_copy) = if let Some(cid) = clip_id {
+    let (start, source_in, duration, effects_to_copy) = if let Some(cid) = clip_id {
         let q = s.active_sequence().ok_or_else(|| bad("ai.apply", "no active sequence"))?;
-        let (track_id, it) = q.find_item(cid).ok_or_else(|| bad("ai.apply", "original clip not found"))?;
-        let next_track = if q.video_tracks.len() > 1 {
-            let current_idx = q.video_tracks.iter().position(|t| t.id == track_id).unwrap_or(0);
-            if current_idx + 1 < q.video_tracks.len() {
-                format!("V{}", current_idx + 2)
-            } else {
-                "new".to_string()
-            }
-        } else {
-            "new".to_string()
-        };
-        (it.start, it.source_in, it.duration, next_track, it.effects.clone())
+        let (_track_id, it) = q.find_item(cid).ok_or_else(|| bad("ai.apply", "original clip not found"))?;
+        (it.start, it.source_in, it.duration, it.effects.clone())
     } else {
-        let q = s.active_sequence().ok_or_else(|| bad("ai.apply", "no active sequence"))?;
-        let track_choice = if q.video_tracks.len() > 1 { "V2".to_string() } else { "new".to_string() };
-        (s.playhead(), filmcraft_time::Tick::ZERO, filmcraft_time::Tick::from_seconds_f64(5.0), track_choice, Vec::new())
+        (s.playhead(), filmcraft_time::Tick::ZERO, filmcraft_time::Tick::from_seconds_f64(5.0), Vec::new())
     };
 
-    let target_track = str_p(p, "track").map(str::to_string).unwrap_or(track_choice);
+    // Always place on the top-most track above all video layers
+    let target_track = str_p(p, "track").map(str::to_string).unwrap_or_else(|| "new".to_string());
 
     // 3. Place clip on timeline
     let place_res = s.execute("timeline.place", json!({
@@ -565,11 +564,93 @@ fn apply_tool(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
 
+    // Auto-save the project so changes are immediately persisted
+    let _ = s.execute("file.save", json!({}));
+
     Ok(json!({
         "status": "applied",
         "importedItem": item_id,
         "track": target_track,
         "path": path,
         "placed": place_res
+    }))
+}
+
+fn preview_tool(s: &mut Session, p: &Value) -> Result<Value> {
+    let clip_id = u64_p(p, "clip").map(ClipId).or_else(|| {
+        let q = s.active_sequence()?;
+        s.state.selection.iter().copied().find(|c| {
+            q.find_item(*c).is_some_and(|(t, _)| q.track(t).is_some_and(|trk| trk.kind == TrackKind::Video))
+        })
+    }).ok_or_else(|| bad("ai.preview", "no video clip selected"))?;
+
+    let q = s.active_sequence().ok_or_else(|| bad("ai.preview", "no active sequence"))?;
+    let (_, it) = q.find_item(clip_id).ok_or_else(|| bad("ai.preview", "clip not found in sequence"))?;
+    let (_, media_clip, _) = s.project.resolve_media(it.item).ok_or_else(|| bad("ai.preview", "cannot resolve media for clip"))?;
+
+    let media_path = match &media_clip.media {
+        filmcraft_project::MediaRef::File { path } => path.clone(),
+        _ => {
+            let tmp_png = format!("/tmp/filmcraft_ai_preview_{}.png", clip_id.0);
+            return Ok(json!({
+                "ok": true,
+                "path": tmp_png,
+                "time": 0.0,
+                "clip": clip_id.0,
+                "mock": true
+            }));
+        }
+    };
+
+    let (script, param, bin) = find_ai_assets().ok_or_else(|| bad("ai.preview", "AI assets not found"))?;
+
+    let time_sec = f64_p(p, "time").unwrap_or_else(|| {
+        let playhead = s.playhead();
+        if playhead >= it.start && playhead < it.start + it.duration {
+            let offset = playhead - it.start;
+            (it.source_in + offset).seconds()
+        } else {
+            it.source_in.seconds()
+        }
+    });
+
+    let feather = f64_p(p, "feather").unwrap_or(2.0);
+    let green_suppr = bool_p(p, "greenSuppression").unwrap_or(true);
+    let res = str_p(p, "res").unwrap_or("480p");
+    let out_png = format!("/tmp/filmcraft_ai_preview_{}.png", clip_id.0);
+
+    let mut cmd = std::process::Command::new("nice");
+    cmd.args([
+        "-n", "19",
+        "ionice", "-c", "3",
+        "uv", "run",
+        "--with", "opencv-python-headless",
+        "--with", "numpy",
+        "--with", "ncnn",
+        script.to_str().unwrap(),
+        "-i", &media_path,
+        "-o", &out_png,
+        "--param", param.to_str().unwrap(),
+        "--model", bin.to_str().unwrap(),
+        "--preview-time", &format!("{time_sec:.3}"),
+        "--feather", &format!("{feather:.1}"),
+        "--res", res,
+    ]);
+    if !green_suppr {
+        cmd.arg("--no-green-suppression");
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let output = cmd.output().map_err(|e| bad("ai.preview", format!("failed to spawn worker: {e}")))?;
+    if !output.status.success() {
+        return Err(bad("ai.preview", "preview worker failed"));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "path": out_png,
+        "time": time_sec,
+        "clip": clip_id.0
     }))
 }

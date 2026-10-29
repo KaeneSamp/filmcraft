@@ -48,6 +48,15 @@ pub struct AiHubState {
     pub last_render_seconds: Option<f64>,
     /// Last finished execution total frames.
     pub last_render_frames: Option<u64>,
+    /// Path to the latest preview frame PNG.
+    pub preview_path: Option<String>,
+    /// Whether to overlay the AI cutout preview directly onto the Program Monitor canvas.
+    pub preview_overlay_program: bool,
+    /// Timestamp in seconds of the current preview.
+    pub preview_time: Option<f64>,
+    /// True while a preview is currently being computed.
+    #[serde(skip)]
+    pub preview_loading: bool,
 }
 
 impl Default for AiHubState {
@@ -65,8 +74,33 @@ impl Default for AiHubState {
             last_render_fps: None,
             last_render_seconds: None,
             last_render_frames: None,
+            preview_path: None,
+            preview_overlay_program: true,
+            preview_time: None,
+            preview_loading: false,
         }
     }
+}
+
+/// Retrieve or load a cached texture handle for an AI preview PNG.
+pub fn get_ai_preview_texture(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+    let key = egui::Id::unique("filmcraft-ai-preview-cache");
+    let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+
+    type CacheEntry = (String, Option<std::time::SystemTime>, egui::TextureHandle);
+    if let Some((cached_path, cached_time, tex)) = ctx.data(|d| d.get_temp::<CacheEntry>(key)) {
+        if cached_path == path && cached_time == mtime {
+            return Some(tex);
+        }
+    }
+
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    let tex = ctx.load_texture("filmcraft-ai-preview-tex", color_image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(key, (path.to_string(), mtime, tex.clone())));
+    Some(tex)
 }
 
 /// Helper to get the primary selected video clip on the active sequence with its duration and track label.
@@ -284,6 +318,114 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                     );
                                 }
                             }
+                        });
+
+                    ui.add_space(10.0);
+
+                    // Preview Card
+                    egui::Frame::new()
+                        .fill(t.field_bg)
+                        .stroke(Stroke::new(1.0, t.field_border))
+                        .corner_radius(6.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(w - 20.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("👁️ Visor de Prévia (Quadro Atual)").size(12.0).strong().color(t.text));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if let Some(sec) = app.ui.ai.preview_time {
+                                        ui.label(egui::RichText::new(format!("Instante {:.2}s", sec)).size(10.5).color(t.text_dim));
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+
+                            // Action buttons & Toggle
+                            ui.horizontal(|ui| {
+                                let can_preview = active_clip.is_some() && !app.ui.ai.preview_loading;
+                                let refresh_btn = egui::Button::new(
+                                    egui::RichText::new("🔄 Atualizar Prévia").size(11.5).color(t.text)
+                                ).min_size(vec2(125.0, 24.0));
+
+                                let btn_resp = ui.add_enabled(can_preview, refresh_btn);
+                                auto.add("ai.preview.refresh", btn_resp.rect, "Atualizar Prévia");
+                                if btn_resp.clicked() {
+                                    if let Some((cid, item, _, _)) = &active_clip {
+                                        let playhead = app.session.playhead();
+                                        let time_sec = if playhead >= item.start && playhead < item.start + item.duration {
+                                            let offset = playhead - item.start;
+                                            (item.source_in + offset).seconds()
+                                        } else {
+                                            item.source_in.seconds()
+                                        };
+                                        let has_assets = filmcraft_engine::ai::find_ai_assets().is_some();
+                                        let res = app.session.execute("ai.preview", json!({
+                                            "clip": cid.0,
+                                            "time": time_sec,
+                                            "smoothing": app.ui.ai.matting_smoothing,
+                                            "feather": app.ui.ai.matting_feather,
+                                            "greenSuppression": app.ui.ai.matting_green_suppression,
+                                            "mock": !has_assets,
+                                            "res": "480p",
+                                        }));
+                                        match res {
+                                            Ok(v) => {
+                                                if let Some(p) = v.get("path").and_then(serde_json::Value::as_str) {
+                                                    app.ui.ai.preview_path = Some(p.to_string());
+                                                    app.ui.ai.preview_time = Some(time_sec);
+                                                    app.ui.status = format!("Prévia atualizada no instante {:.2}s!", time_sec);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                app.ui.status = format!("Erro ao gerar prévia: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                ui.add_space(4.0);
+                                let check_resp = ui.checkbox(&mut app.ui.ai.preview_overlay_program, "Sobrepor no Monitor Principal");
+                                auto.add("ai.preview.overlay", check_resp.rect, "Sobrepor Prévia");
+                            });
+
+                            ui.add_space(4.0);
+
+                            // Preview viewport (16:9 box with dark background)
+                            let thumb_w = (w - 36.0).max(120.0);
+                            let thumb_h = (thumb_w * 9.0 / 16.0).min(110.0);
+                            let (thumb_rect, _) = ui.allocate_exact_size(vec2(thumb_w, thumb_h), Sense::hover());
+                            ui.painter().rect_filled(thumb_rect, 4.0, Color32::from_rgb(0x18, 0x18, 0x1c));
+
+                            let mut drew_img = false;
+                            if let Some(ref path) = app.ui.ai.preview_path {
+                                if let Some(tex) = get_ai_preview_texture(ui.ctx(), path) {
+                                    ui.painter().image(
+                                        tex.id(),
+                                        thumb_rect,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                    drew_img = true;
+                                }
+                            }
+
+                            if !drew_img {
+                                let placeholder_text = if app.ui.ai.preview_loading {
+                                    "⚡ Processando prévia na GPU Vulkan..."
+                                } else if active_clip.is_some() {
+                                    "Clique acima para pré-visualizar o recorte no quadro atual"
+                                } else {
+                                    "Selecione um clipe de vídeo para habilitar a prévia"
+                                };
+                                ui.painter().text(
+                                    thumb_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    placeholder_text,
+                                    Tokens::ui(11.0),
+                                    t.text_faint,
+                                );
+                            }
+                            ui.painter().rect_stroke(thumb_rect, 4.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
                         });
 
                     ui.add_space(10.0);

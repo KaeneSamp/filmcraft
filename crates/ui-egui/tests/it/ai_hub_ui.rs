@@ -120,6 +120,13 @@ fn ai_studio_interactive_run_and_cancel_lifecycle() {
     assert!(ids.contains(&"ai.smoothing".to_string()), "missing ai.smoothing in {ids:?}");
     assert!(ids.contains(&"ai.feather".to_string()), "missing ai.feather in {ids:?}");
     assert!(ids.contains(&"ai.greenSuppression".to_string()), "missing ai.greenSuppression in {ids:?}");
+    assert!(ids.contains(&"ai.preview.refresh".to_string()), "missing ai.preview.refresh in {ids:?}");
+    assert!(ids.contains(&"ai.preview.overlay".to_string()), "missing ai.preview.overlay in {ids:?}");
+
+    // Test preview refresh click
+    d.click("ai.preview.refresh");
+    d.frames(4);
+    assert!(d.state().ui.ai.preview_path.is_some(), "preview_path should be populated after refresh");
 
     // Click Run button
     d.click("ai.run");
