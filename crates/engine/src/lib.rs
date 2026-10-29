@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod aaf_omf;
+pub mod ai;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
@@ -1393,3 +1394,5 @@ mod source_placement_tests;
 mod frame_export_tests;
 #[cfg(test)]
 mod wasm_clock_tests;
+#[cfg(test)]
+mod ai_tests;
