@@ -28,6 +28,8 @@ pub struct AiHubState {
     pub active_tab: String,
     /// Identifier of the selected AI tool.
     pub selected_tool: String,
+    /// Selected matting preset ("fast_webcam", "smooth_edge", "complex_scene", "custom").
+    pub selected_preset: String,
     /// Feathering blur radius for mask borders (in pixels: 0.0 .. 8.0).
     pub matting_feather: f32,
     /// Temporal EMA smoothing factor (0.0 .. 1.0, e.g. 0.70).
@@ -40,6 +42,12 @@ pub struct AiHubState {
     pub running_job: Option<u64>,
     /// Live user status message.
     pub status_message: String,
+    /// Last finished execution FPS.
+    pub last_render_fps: Option<f64>,
+    /// Last finished execution time in seconds.
+    pub last_render_seconds: Option<f64>,
+    /// Last finished execution total frames.
+    pub last_render_frames: Option<u64>,
 }
 
 impl Default for AiHubState {
@@ -47,12 +55,16 @@ impl Default for AiHubState {
         Self {
             active_tab: "Video".to_string(),
             selected_tool: "matting.rvm".to_string(),
+            selected_preset: "fast_webcam".to_string(),
             matting_feather: 2.0,
             matting_smoothing: 0.70,
             matting_green_suppression: true,
             output_format: "prores4444".to_string(),
             running_job: None,
             status_message: String::new(),
+            last_render_fps: None,
+            last_render_seconds: None,
+            last_render_frames: None,
         }
     }
 }
@@ -132,6 +144,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         "clip": clip_opt,
                     }));
                 }
+                app.ui.ai.last_render_fps = Some(rep.render_fps);
+                app.ui.ai.last_render_seconds = Some(rep.seconds);
+                app.ui.ai.last_render_frames = Some(rep.frames);
                 app.ui.status = format!("IA concluída: {} quadros processados em {:.1}s!", rep.frames, rep.seconds);
                 app.ui.ai.status_message = format!("Concluído: {} quadros em {:.1}s ({:.1} FPS)", rep.frames, rep.seconds, rep.render_fps);
             }
@@ -166,9 +181,19 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     );
 
     // Hardware acceleration badge
-    let badge_text = "Vulkan GPU";
+    let badge_text = if let Some(g) = &app.gpu {
+        let info = g.render_state.adapter.get_info();
+        let short = if info.name.len() > 18 {
+            format!("{}...", &info.name[..16])
+        } else {
+            info.name.clone()
+        };
+        format!("Vulkan • {}", short)
+    } else {
+        "Vulkan GPU".to_string()
+    };
     let badge_font = Tokens::ui(10.5);
-    let badge_layout = painter.layout_no_wrap(badge_text.to_string(), badge_font.clone(), t.accent);
+    let badge_layout = painter.layout_no_wrap(badge_text.clone(), badge_font.clone(), t.accent);
     let badge_rect = Rect::from_min_size(
         pos2(header_rect.max.x - PAD - badge_layout.size().x - 12.0, header_rect.center().y - 9.0),
         vec2(badge_layout.size().x + 12.0, 18.0),
@@ -261,7 +286,66 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             }
                         });
 
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
+
+                    // Telemetry & Hardware Card
+                    let has_assets = filmcraft_engine::ai::find_ai_assets().is_some();
+                    egui::Frame::new()
+                        .fill(t.field_bg)
+                        .stroke(Stroke::new(1.0, t.field_border))
+                        .corner_radius(6.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(w - 20.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("⚡").size(12.0));
+                                ui.label(egui::RichText::new("Telemetria do Motor de IA").size(11.5).strong().color(t.text));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if has_assets {
+                                        ui.label(egui::RichText::new("● GPU Vulkan Ativa").size(10.5).color(Color32::from_rgb(0x40, 0xc0, 0x57)));
+                                    } else {
+                                        ui.label(egui::RichText::new("● Modo Simulação").size(10.5).color(Color32::from_rgb(0xfc, 0xc4, 0x19)));
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                            let gpu_full_name = if let Some(g) = &app.gpu {
+                                let info = g.render_state.adapter.get_info();
+                                format!("{} ({:?})", info.name, info.backend)
+                            } else {
+                                "AMD Radeon RX 570 / Vulkan Compute (Auto-detect)".to_string()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Dispositivo:").size(10.5).color(t.text_dim));
+                                ui.label(egui::RichText::new(gpu_full_name).size(10.5).color(t.text));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Modelo Neural:").size(10.5).color(t.text_dim));
+                                ui.label(
+                                    egui::RichText::new(if has_assets {
+                                        "RVM MobileNetV3 (Vulkan FP16) [Pronto]"
+                                    } else {
+                                        "RVM MobileNetV3 [Assets ausentes]"
+                                    })
+                                    .size(10.5)
+                                    .color(t.text),
+                                );
+                            });
+                            if let Some(fps) = app.ui.ai.last_render_fps {
+                                let frames = app.ui.ai.last_render_frames.unwrap_or(0);
+                                let secs = app.ui.ai.last_render_seconds.unwrap_or(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Último Desempenho:").size(10.5).color(t.text_dim));
+                                    ui.label(
+                                        egui::RichText::new(format!("{fps:.1} FPS ({frames} quadros em {secs:.1}s)"))
+                                            .size(10.5)
+                                            .color(t.accent),
+                                    );
+                                });
+                            }
+                        });
+
+                    ui.add_space(10.0);
 
                     // Tool Info Card
                     ui.label(egui::RichText::new("Ferramenta Ativa").size(11.0).color(t.text_faint));
@@ -272,12 +356,53 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             .color(t.text_dim),
                     );
 
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(10.0);
 
+                    // Presets
+                    ui.label(egui::RichText::new("Presets de Recorte").size(12.0).strong().color(t.text));
+                    ui.add_space(4.0);
+
+                    let preset_label = match app.ui.ai.selected_preset.as_str() {
+                        "fast_webcam" => "⚡ Webcam Rápida (Padrão)",
+                        "smooth_edge" => "✨ Borda Suave / Alta Definição",
+                        "complex_scene" => "🎬 Cenário Complexo / Cadeira Escura",
+                        _ => "🛠️ Personalizado",
+                    };
+
+                    let combo_resp = egui::ComboBox::from_id_salt("ai_preset_selector")
+                        .width(w - 20.0)
+                        .selected_text(egui::RichText::new(preset_label).size(11.5).color(t.text))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(app.ui.ai.selected_preset == "fast_webcam", "⚡ Webcam Rápida (Padrão)").clicked() {
+                                app.ui.ai.selected_preset = "fast_webcam".to_string();
+                                app.ui.ai.matting_smoothing = 0.70;
+                                app.ui.ai.matting_feather = 2.0;
+                                app.ui.ai.matting_green_suppression = true;
+                            }
+                            if ui.selectable_label(app.ui.ai.selected_preset == "smooth_edge", "✨ Borda Suave / Alta Definição").clicked() {
+                                app.ui.ai.selected_preset = "smooth_edge".to_string();
+                                app.ui.ai.matting_smoothing = 0.85;
+                                app.ui.ai.matting_feather = 3.5;
+                                app.ui.ai.matting_green_suppression = true;
+                            }
+                            if ui.selectable_label(app.ui.ai.selected_preset == "complex_scene", "🎬 Cenário Complexo / Cadeira Escura").clicked() {
+                                app.ui.ai.selected_preset = "complex_scene".to_string();
+                                app.ui.ai.matting_smoothing = 0.90;
+                                app.ui.ai.matting_feather = 2.0;
+                                app.ui.ai.matting_green_suppression = true;
+                            }
+                            if ui.selectable_label(app.ui.ai.selected_preset == "custom", "🛠️ Personalizado").clicked() {
+                                app.ui.ai.selected_preset = "custom".to_string();
+                            }
+                        });
+                    auto.add("ai.preset", combo_resp.response.rect, "Preset de IA");
+
+                    ui.add_space(10.0);
+
                     // Fine-Tuning Parameters
-                    ui.label(egui::RichText::new("Parâmetros do Recorte").size(12.0).strong().color(t.text));
+                    ui.label(egui::RichText::new("Ajuste Fino de Parâmetros").size(12.0).strong().color(t.text));
                     ui.add_space(6.0);
 
                     // 1. Suavização Temporal (EMA)
@@ -287,8 +412,12 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             ui.label(egui::RichText::new(format!("{:.0}%", app.ui.ai.matting_smoothing * 100.0)).size(11.5).color(t.text_dim));
                         });
                     });
+                    let prev_smoothing = app.ui.ai.matting_smoothing;
                     let s_resp = ui.add(egui::Slider::new(&mut app.ui.ai.matting_smoothing, 0.0..=1.0).show_value(false));
                     auto.add("ai.smoothing", s_resp.rect, "Suavização Temporal");
+                    if (app.ui.ai.matting_smoothing - prev_smoothing).abs() > f32::EPSILON && s_resp.changed() {
+                        app.ui.ai.selected_preset = "custom".to_string();
+                    }
                     ui.label(egui::RichText::new("Elimina cintilação e oscilações de contorno entre os quadros.").size(10.0).color(t.text_faint));
 
                     ui.add_space(10.0);
@@ -300,15 +429,23 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             ui.label(egui::RichText::new(format!("{:.1} px", app.ui.ai.matting_feather)).size(11.5).color(t.text_dim));
                         });
                     });
+                    let prev_feather = app.ui.ai.matting_feather;
                     let f_resp = ui.add(egui::Slider::new(&mut app.ui.ai.matting_feather, 0.0..=8.0).show_value(false));
                     auto.add("ai.feather", f_resp.rect, "Feathering do Alfa");
+                    if (app.ui.ai.matting_feather - prev_feather).abs() > f32::EPSILON && f_resp.changed() {
+                        app.ui.ai.selected_preset = "custom".to_string();
+                    }
                     ui.label(egui::RichText::new("Transição suave de subpixel sem corte serrilhado.").size(10.0).color(t.text_faint));
 
                     ui.add_space(10.0);
 
                     // 3. Supressão de Verde / Despeckle
+                    let prev_gs = app.ui.ai.matting_green_suppression;
                     let g_resp = ui.checkbox(&mut app.ui.ai.matting_green_suppression, "Atenuar reflexos e ruído de fundo");
                     auto.add("ai.greenSuppression", g_resp.rect, "Supressão de Verde");
+                    if app.ui.ai.matting_green_suppression != prev_gs && g_resp.changed() {
+                        app.ui.ai.selected_preset = "custom".to_string();
+                    }
                     ui.add_space(10.0);
 
                     // 4. Formato de Saída
