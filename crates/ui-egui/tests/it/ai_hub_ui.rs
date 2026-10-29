@@ -64,6 +64,11 @@ impl Driver {
         v.as_array().unwrap().iter().filter_map(|e| e["id"].as_str().map(str::to_string)).collect()
     }
 
+    fn click(&mut self, id: &str) {
+        self.ok("ui.click", json!({"id": id}));
+        self.frames(3);
+    }
+
     fn state(&self) -> &FilmcraftApp {
         self.harness.state()
     }
@@ -96,4 +101,43 @@ fn ai_studio_panel_opens_docks_and_exposes_controls() {
     assert_eq!(d.state().ui.ai.selected_tool, "matting.rvm");
     assert!((d.state().ui.ai.matting_smoothing - 0.70).abs() < f32::EPSILON);
     assert!((d.state().ui.ai.matting_feather - 2.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn ai_studio_interactive_run_and_cancel_lifecycle() {
+    let mut d = Driver::demo();
+    d.exec("window.panel.AiHub", json!({}));
+    d.frames(4);
+
+    // Select the first video clip on the demo sequence
+    let seq = d.exec("sequence.inspect", json!({}));
+    let first_clip = seq["video"][0]["items"][0]["clip"].as_u64().unwrap();
+    d.exec("timeline.select", json!({"clips": [first_clip]}));
+    d.frames(4);
+
+    // Verify clip selection is picked up and controls are rendered
+    let ids = d.ids("ai.");
+    assert!(ids.contains(&"ai.smoothing".to_string()), "missing ai.smoothing in {ids:?}");
+    assert!(ids.contains(&"ai.feather".to_string()), "missing ai.feather in {ids:?}");
+    assert!(ids.contains(&"ai.greenSuppression".to_string()), "missing ai.greenSuppression in {ids:?}");
+
+    // Click Run button
+    d.click("ai.run");
+    d.frames(6);
+
+    // A running job must be tracked in app.ui.ai.running_job
+    let running_job = d.state().ui.ai.running_job;
+    assert!(running_job.is_some(), "an AI job must have been launched");
+
+    // The Cancel button must now be visible in automation elements
+    let job_ids = d.ids("ai.");
+    assert!(job_ids.contains(&"ai.cancel".to_string()), "ai.cancel must be visible during run: {job_ids:?}");
+
+    // Click Cancel
+    d.click("ai.cancel");
+    d.frames(10);
+
+    // Job should be finished/cancelled and ai.run button reappears
+    let cancel_ids = d.ids("ai.");
+    assert!(cancel_ids.contains(&"ai.run".to_string()), "ai.run button must reappear after cancel");
 }
