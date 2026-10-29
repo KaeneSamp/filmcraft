@@ -148,3 +148,27 @@ fn ai_studio_interactive_run_and_cancel_lifecycle() {
     let cancel_ids = d.ids("ai.");
     assert!(cancel_ids.contains(&"ai.run".to_string()), "ai.run button must reappear after cancel");
 }
+
+#[test]
+fn ai_studio_silence_trimmer_tab_and_controls() {
+    let mut d = Driver::demo();
+    d.exec("window.panel.AiHub", json!({}));
+    d.frames(4);
+
+    // Click Automation tab
+    d.click("ai.tab.Automation");
+    d.frames(4);
+
+    assert_eq!(d.state().ui.ai.active_tab, "Automation");
+    assert_eq!(d.state().ui.ai.selected_tool, "timeline.silence");
+
+    // Verify silence trimmer element IDs
+    let ids = d.ids("ai.silence.");
+    assert!(ids.contains(&"ai.silence.threshold".to_string()), "missing threshold slider: {ids:?}");
+    assert!(ids.contains(&"ai.silence.min_duration".to_string()), "missing min_duration slider: {ids:?}");
+    assert!(ids.contains(&"ai.silence.padding".to_string()), "missing padding slider: {ids:?}");
+    assert!(ids.contains(&"ai.silence.all_tracks".to_string()), "missing all_tracks checkbox: {ids:?}");
+    assert!(ids.contains(&"ai.silence.analyze".to_string()), "missing analyze button: {ids:?}");
+    assert!(ids.contains(&"ai.silence.cut".to_string()), "missing cut button: {ids:?}");
+}
+

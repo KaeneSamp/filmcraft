@@ -14,7 +14,8 @@ use std::io::BufRead;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use filmcraft_project::{ClipId, TrackKind};
+use filmcraft_project::{ClipId, TrackId, TrackKind};
+use filmcraft_time::{Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -69,6 +70,14 @@ pub fn available_tools() -> Vec<AiToolInfo> {
             name: "Auto-Captions (Whisper)".to_string(),
             category: "Audio".to_string(),
             description: "Local speech-to-text generating synced captions directly on the timeline.".to_string(),
+            accelerated: true,
+            inputs: vec!["sequence".to_string()],
+        },
+        AiToolInfo {
+            id: "timeline.silence".to_string(),
+            name: "Aparador de Silêncios".to_string(),
+            category: "Automation".to_string(),
+            description: "Detecta e apara pausas e silêncios sincronizando todas as camadas do projeto.".to_string(),
             accelerated: true,
             inputs: vec!["sequence".to_string()],
         },
@@ -176,6 +185,26 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: preview_tool,
             journal: false,
         },
+        CommandSpec {
+            id: "timeline.silence",
+            label: "Trim Silence",
+            menu: &["Timeline", "Trim Silence"],
+            shortcut: None,
+            params: r#"{"track":str?,"clip":id?,"thresholdDb":f64=-36.0,"minDuration":f64=0.7,"padding":f64=0.15,"apply":bool=false,"allTracks":bool=true,"mock":bool=false}"#,
+            enabled: has_seq,
+            run: silence_tool,
+            journal: true,
+        },
+        CommandSpec {
+            id: "ai.silence",
+            label: "AI Trim Silence",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"track":str?,"clip":id?,"thresholdDb":f64=-36.0,"minDuration":f64=0.7,"padding":f64=0.15,"apply":bool=false,"allTracks":bool=true,"mock":bool=false}"#,
+            enabled: has_seq,
+            run: silence_tool,
+            journal: true,
+        },
     ]
 }
 
@@ -207,6 +236,9 @@ pub fn parse_worker_line(line: &str, progress: &Arc<filmcraft_export::Progress>)
 
 fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let tool_id = p.get("tool").and_then(Value::as_str).unwrap_or("matting.rvm");
+    if tool_id == "timeline.silence" || tool_id == "ai.silence" {
+        return silence_tool(s, p);
+    }
     let smoothing = f64_p(p, "smoothing").unwrap_or(0.70).clamp(0.0, 1.0);
     let feather = f64_p(p, "feather").unwrap_or(2.0).clamp(0.0, 8.0);
     let green_suppr = bool_p(p, "greenSuppression").unwrap_or(true);
@@ -655,5 +687,226 @@ fn preview_tool(s: &mut Session, p: &Value) -> Result<Value> {
         "path": out_png,
         "time": time_sec,
         "clip": clip_id.0
+    }))
+}
+
+/// Detect and trim audio silences across the active sequence, ripple-deleting across all
+/// unlocked tracks (video, webcam, audio) synchronously to maintain perfect multi-track sync.
+pub fn silence_tool(s: &mut Session, p: &Value) -> Result<Value> {
+    let threshold_db = f64_p(p, "thresholdDb").unwrap_or(-36.0).clamp(-80.0, -10.0);
+    let min_duration = f64_p(p, "minDuration").unwrap_or(0.70).clamp(0.1, 10.0);
+    let padding = f64_p(p, "padding").unwrap_or(0.15).clamp(0.0, 1.0);
+    let apply = bool_p(p, "apply").unwrap_or(false);
+    let all_tracks = bool_p(p, "allTracks").unwrap_or(true);
+    let mock = bool_p(p, "mock").unwrap_or(false);
+
+    let q = s.active_sequence().ok_or_else(|| bad("timeline.silence", "no active sequence"))?;
+
+    // Determine target track or target items
+    let clip_id = p.get("clip").and_then(Value::as_u64).map(ClipId).or_else(|| {
+        s.state.selection.iter().copied().find(|c| {
+            q.find_item(*c).is_some()
+        })
+    });
+
+    let (target_track_id, target_track_name, items_to_analyze): (TrackId, String, Vec<(Tick, Tick, Tick, String)>) = if let Some(cid) = clip_id {
+        if let Some((track_id, it)) = q.find_item(cid) {
+            let trk = q.track(track_id).ok_or_else(|| bad("timeline.silence", "track not found"))?;
+            let (_, media_clip, _) = s.project.resolve_media(it.item)
+                .ok_or_else(|| bad("timeline.silence", "cannot resolve media for clip"))?;
+            let media_path = match &media_clip.media {
+                filmcraft_project::MediaRef::File { path } => path.clone(),
+                _ => {
+                    if mock {
+                        "mock_audio.wav".to_string()
+                    } else {
+                        return Err(bad("timeline.silence", "selected clip does not reference a media file"));
+                    }
+                }
+            };
+            (track_id, trk.name.clone(), vec![(it.start, it.duration, it.source_in, media_path)])
+        } else {
+            return Err(bad("timeline.silence", "selected clip not found in sequence"));
+        }
+    } else {
+        // Find best audio track
+        let trk = if let Some(tr_param) = str_p(p, "track") {
+            if let Ok(id_num) = tr_param.parse::<u64>() {
+                q.audio_tracks.iter().find(|t| t.id == TrackId(id_num))
+            } else {
+                q.audio_tracks.iter().find(|t| t.name.eq_ignore_ascii_case(tr_param))
+            }
+        } else {
+            // Auto preference:
+            // 1. Audio track with "mic", "microfone", "voz", "voice", "dialog" that has items
+            q.audio_tracks.iter().find(|t| {
+                !t.items.is_empty() && {
+                    let n = t.name.to_lowercase();
+                    n.contains("mic") || n.contains("voz") || n.contains("voice") || n.contains("dialog")
+                }
+            })
+            // 2. Any audio track that has items
+            .or_else(|| q.audio_tracks.iter().find(|t| !t.items.is_empty()))
+            // 3. Fallback to first video track with items
+            .or_else(|| q.video_tracks.iter().find(|t| !t.items.is_empty()))
+        };
+
+        let trk = trk.ok_or_else(|| bad("timeline.silence", "no track with media found to analyze for silence"))?;
+        let trk_id = trk.id;
+        let trk_name = trk.name.clone();
+
+        let mut items = Vec::new();
+        for it in &trk.items {
+            if let Some((_, media_clip, _)) = s.project.resolve_media(it.item) {
+                if let filmcraft_project::MediaRef::File { path } = &media_clip.media {
+                    items.push((it.start, it.duration, it.source_in, path.clone()));
+                } else if mock {
+                    items.push((it.start, it.duration, it.source_in, "mock_audio.wav".to_string()));
+                }
+            }
+        }
+        (trk_id, trk_name, items)
+    };
+
+    if items_to_analyze.is_empty() && !mock {
+        return Err(bad("timeline.silence", "no media clips found on target track to analyze"));
+    }
+
+    let mut ranges: Vec<TimeRange> = Vec::new();
+
+    if mock {
+        // In mock mode, generate 2 sample pauses to test multi-track ripple
+        let t1 = Tick::from_seconds_f64(1.0);
+        let t2 = Tick::from_seconds_f64(2.0);
+        let t3 = Tick::from_seconds_f64(4.0);
+        let t4 = Tick::from_seconds_f64(5.0);
+        ranges.push(TimeRange::from_bounds(t1, t2));
+        ranges.push(TimeRange::from_bounds(t3, t4));
+    } else {
+        for (item_start, item_duration, item_source_in, media_path) in &items_to_analyze {
+            let start_sec = item_source_in.seconds();
+            let dur_sec = item_duration.seconds();
+
+            let mut cmd = std::process::Command::new("nice");
+            cmd.args([
+                "-n", "19",
+                "ionice", "-c", "3",
+                "ffmpeg", "-v", "info",
+            ]);
+            if start_sec > 0.0 {
+                cmd.args(["-ss", &format!("{start_sec:.3}")]);
+            }
+            if dur_sec > 0.0 {
+                cmd.args(["-t", &format!("{dur_sec:.3}")]);
+            }
+            cmd.args([
+                "-i", media_path,
+                "-af", &format!("silencedetect=noise={threshold_db:.1}dB:d={min_duration:.2}"),
+                "-f", "null", "-",
+            ]);
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+
+            let output = cmd.output().map_err(|e| bad("timeline.silence", format!("failed to run ffmpeg: {e}")))?;
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+            let mut cur_silence_start: Option<f64> = None;
+            for line in stderr_str.lines() {
+                if let Some(pos) = line.find("silence_start: ") {
+                    let part = &line[pos + "silence_start: ".len()..];
+                    if let Some(val_str) = part.split_whitespace().next() {
+                        if let Ok(val) = val_str.parse::<f64>() {
+                            cur_silence_start = Some(val);
+                        }
+                    }
+                } else if let Some(pos) = line.find("silence_end: ") {
+                    let part = &line[pos + "silence_end: ".len()..];
+                    if let Some(val_str) = part.split('|').next().and_then(|s| s.split_whitespace().next()) {
+                        if let Ok(end_val) = val_str.parse::<f64>() {
+                            if let Some(start_val) = cur_silence_start.take() {
+                                let timeline_silence_start = item_start.seconds() + start_val;
+                                let timeline_silence_end = item_start.seconds() + end_val;
+
+                                let cut_start = timeline_silence_start + padding;
+                                let cut_end = timeline_silence_end - padding;
+
+                                if cut_end > cut_start {
+                                    ranges.push(TimeRange::from_bounds(
+                                        Tick::from_seconds_f64(cut_start),
+                                        Tick::from_seconds_f64(cut_end),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle trailing silence that reaches the end of the clip
+            if let Some(start_val) = cur_silence_start.take() {
+                let end_val = dur_sec;
+                let timeline_silence_start = item_start.seconds() + start_val;
+                let timeline_silence_end = item_start.seconds() + end_val;
+
+                let cut_start = timeline_silence_start + padding;
+                let cut_end = timeline_silence_end;
+
+                if cut_end > cut_start {
+                    ranges.push(TimeRange::from_bounds(
+                        Tick::from_seconds_f64(cut_start),
+                        Tick::from_seconds_f64(cut_end),
+                    ));
+                }
+            }
+        }
+    }
+
+    let merged_ranges = filmcraft_edit::transcript::merge_ranges(ranges);
+    let total_count = merged_ranges.len();
+    let total_secs_raw: f64 = merged_ranges.iter().map(|r| r.duration.seconds()).sum();
+
+    let removed_ticks = if apply && !merged_ranges.is_empty() {
+        let ranges_to_apply = merged_ranges.clone();
+        let total_removed = if all_tracks {
+            s.edit_sequence("Aparar Silêncios", |q, ctx, _| {
+                Ok(filmcraft_edit::transcript::ripple_delete_ranges(q, ranges_to_apply, ctx))
+            })?
+        } else {
+            let trk_id = target_track_id;
+            s.edit_sequence("Aparar Silêncios (Trilha)", |q, ctx, _| {
+                let tracks = vec![trk_id];
+                let mut total = Tick::ZERO;
+                for r in filmcraft_edit::transcript::merge_ranges(ranges_to_apply).into_iter().rev() {
+                    if r.duration <= Tick::ZERO {
+                        continue;
+                    }
+                    filmcraft_edit::extract(q, &tracks, r, ctx);
+                    total += r.duration;
+                }
+                Ok(total)
+            })?
+        };
+        let _ = s.execute("file.save", json!({}));
+        total_removed
+    } else {
+        Tick::ZERO
+    };
+
+    let saved_secs = if apply { removed_ticks.seconds() } else { total_secs_raw };
+
+    Ok(json!({
+        "status": if apply { "applied" } else { "analyzed" },
+        "count": total_count,
+        "trimmedSeconds": saved_secs,
+        "rawSilenceSeconds": total_secs_raw,
+        "applied": apply,
+        "track": target_track_id.0,
+        "trackName": target_track_name,
+        "allTracks": all_tracks,
+        "message": if apply {
+            format!("Aparadas {} pausas em todas as camadas ({:.1}s economizados)", total_count, saved_secs)
+        } else {
+            format!("Detectadas {} pausas ({:.1}s que serão economizados)", total_count, saved_secs)
+        }
     }))
 }

@@ -154,3 +154,48 @@ fn ai_preview_generates_frame_result() {
     assert_eq!(res["clip"], first_clip);
 }
 
+#[test]
+fn timeline_silence_analyzes_and_reports_pauses() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+
+    let res = s.execute("timeline.silence", json!({
+        "mock": true,
+        "apply": false,
+        "thresholdDb": -35.0,
+        "minDuration": 0.5,
+    })).unwrap();
+
+    assert_eq!(res["status"], "analyzed");
+    assert_eq!(res["applied"], false);
+    assert_eq!(res["count"], 2);
+    assert!(res["trimmedSeconds"].as_f64().unwrap_or(0.0) > 0.0);
+}
+
+#[test]
+fn timeline_silence_applies_multi_track_ripple_delete_and_supports_undo() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+
+    let dur_before = s.active_sequence().unwrap().duration();
+
+    let res = s.execute("timeline.silence", json!({
+        "mock": true,
+        "apply": true,
+        "allTracks": true,
+    })).unwrap();
+
+    assert_eq!(res["status"], "applied");
+    assert_eq!(res["applied"], true);
+    assert_eq!(res["count"], 2);
+
+    let dur_after = s.active_sequence().unwrap().duration();
+    assert!(dur_after < dur_before, "timeline duration should be shorter after ripple delete");
+
+    // Test Ctrl+Z Undo restores the sequence
+    s.execute("edit.undo", json!({})).unwrap();
+    let dur_restored = s.active_sequence().unwrap().duration();
+    assert_eq!(dur_restored, dur_before, "undo should restore exact sequence duration");
+}
+
+

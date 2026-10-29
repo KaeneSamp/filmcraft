@@ -57,6 +57,16 @@ pub struct AiHubState {
     /// True while a preview is currently being computed.
     #[serde(skip)]
     pub preview_loading: bool,
+    /// Silence detection threshold in dB (-60.0 to -15.0 dB, e.g. -36.0 dB).
+    pub silence_threshold_db: f32,
+    /// Minimum silence duration in seconds to trim (0.20 to 2.50s, e.g. 0.70s).
+    pub silence_min_duration: f32,
+    /// Safety breath padding in seconds to keep before/after speech (0.05 to 0.35s, e.g. 0.15s).
+    pub silence_padding: f32,
+    /// Whether to ripple-cut across all unlocked tracks (webcam + gameplay + audio).
+    pub silence_all_tracks: bool,
+    /// Last detected silence stats: (count, total_seconds_trimmed)
+    pub silence_last_stats: Option<(usize, f64)>,
 }
 
 impl Default for AiHubState {
@@ -78,6 +88,11 @@ impl Default for AiHubState {
             preview_overlay_program: true,
             preview_time: None,
             preview_loading: false,
+            silence_threshold_db: -36.0,
+            silence_min_duration: 0.70,
+            silence_padding: 0.15,
+            silence_all_tracks: true,
+            silence_last_stats: None,
         }
     }
 }
@@ -257,6 +272,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
         if resp.clicked() {
             app.ui.ai.active_tab = tab_name.to_string();
+            if tab_name == "Automation" && app.ui.ai.selected_tool != "scene.detect" {
+                app.ui.ai.selected_tool = "timeline.silence".to_string();
+            } else if tab_name == "Video" && app.ui.ai.selected_tool != "matting.rvm" {
+                app.ui.ai.selected_tool = "matting.rvm".to_string();
+            }
         }
         tab_x += text_layout.size().x + 20.0;
     }
@@ -636,21 +656,107 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     ui.label(egui::RichText::new("Automações Inteligentes").size(13.0).strong().color(t.text));
                     ui.add_space(8.0);
                     for (id, name, desc) in [
-                        ("scene.detect", "Detecção de Cortes de Cena", "Detecta mudanças de plano e cria cortes automáticos na timeline."),
-                        ("timeline.silence", "Aparador de Silêncios", "Localiza pausas longas e acelera o ritmo da gravação."),
+                        ("timeline.silence", "✂️ Aparador de Silêncios", "Localiza pausas longas e apara todas as camadas sincronizadas."),
+                        ("scene.detect", "🎬 Detecção de Cortes de Cena", "Detecta mudanças de plano e cria cortes automáticos na timeline."),
                     ] {
-                        egui::Frame::new()
-                            .fill(t.field_bg)
-                            .stroke(Stroke::new(1.0, t.field_border))
+                        let is_active = app.ui.ai.selected_tool == id;
+                        let frame_resp = egui::Frame::new()
+                            .fill(if is_active { t.pill_active_bg } else { t.field_bg })
+                            .stroke(Stroke::new(1.0, if is_active { t.accent } else { t.field_border }))
                             .corner_radius(6.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.set_width(w - 16.0);
-                                ui.label(egui::RichText::new(name).size(12.0).strong().color(t.text));
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(name).size(12.0).strong().color(t.text));
+                                    if is_active {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("Ativo").size(10.5).color(t.accent));
+                                        });
+                                    }
+                                });
                                 ui.label(egui::RichText::new(desc).size(11.0).color(t.text_dim));
                             });
-                        auto.add(&format!("ai.tool.{id}"), ui.min_rect(), name);
+                        if ui.interact(frame_resp.response.rect, frame_resp.response.id, egui::Sense::click()).clicked() {
+                            app.ui.ai.selected_tool = id.to_string();
+                        }
+                        auto.add(&format!("ai.tool.{id}"), frame_resp.response.rect, name);
                         ui.add_space(6.0);
+                    }
+
+                    if app.ui.ai.selected_tool == "timeline.silence" {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(egui::RichText::new("Ajustes do Aparador de Silêncios").size(12.0).strong().color(t.text));
+                        ui.add_space(6.0);
+
+                        // 1. Limiar de Volume / Sensibilidade (dB)
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Sensibilidade (Limiar de Volume)").size(11.5).color(t.text));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{:.0} dB", app.ui.ai.silence_threshold_db)).size(11.5).color(t.text_dim));
+                            });
+                        });
+                        let th_resp = ui.add(egui::Slider::new(&mut app.ui.ai.silence_threshold_db, -60.0..=-15.0).show_value(false));
+                        auto.add("ai.silence.threshold", th_resp.rect, "Limiar de Volume");
+                        ui.label(egui::RichText::new("Sons abaixo deste nível são tratados como silêncio (padrão: -36 dB).").size(10.0).color(t.text_faint));
+
+                        ui.add_space(8.0);
+
+                        // 2. Duração Mínima da Pausa (s)
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Pausa Mínima para Corte").size(11.5).color(t.text));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{:.2} s", app.ui.ai.silence_min_duration)).size(11.5).color(t.text_dim));
+                            });
+                        });
+                        let md_resp = ui.add(egui::Slider::new(&mut app.ui.ai.silence_min_duration, 0.20..=2.50).show_value(false));
+                        auto.add("ai.silence.min_duration", md_resp.rect, "Pausa Mínima");
+                        ui.label(egui::RichText::new("Pausas menores que esta duração são mantidas intactas (padrão: 0.70s).").size(10.0).color(t.text_faint));
+
+                        ui.add_space(8.0);
+
+                        // 3. Margem de Fala / Respiro (Padding)
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Margem de Fala (Padding / Respiro)").size(11.5).color(t.text));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{:.0} ms", app.ui.ai.silence_padding * 1000.0)).size(11.5).color(t.text_dim));
+                            });
+                        });
+                        let pad_resp = ui.add(egui::Slider::new(&mut app.ui.ai.silence_padding, 0.05..=0.35).show_value(false));
+                        auto.add("ai.silence.padding", pad_resp.rect, "Margem de Fala");
+                        ui.label(egui::RichText::new("Tempo mantido antes e após falar para nunca engolir palavras (padrão: 150ms).").size(10.0).color(t.text_faint));
+
+                        ui.add_space(8.0);
+
+                        // 4. Sincronização Multitrilha
+                        let cb_resp = ui.checkbox(&mut app.ui.ai.silence_all_tracks, egui::RichText::new("Sincronizar Todas as Camadas (Webcam + Jogo + Áudio)").size(11.5).color(t.text));
+                        auto.add("ai.silence.all_tracks", cb_resp.rect, "Sincronizar Multitrilha");
+                        ui.label(egui::RichText::new("Aplica o corte ripple simultaneamente em todas as trilhas desbloqueadas.").size(10.0).color(t.text_faint));
+
+                        // 5. Se houver estatística de análise prévia, mostrar o badge
+                        if let Some((count, secs)) = app.ui.ai.silence_last_stats {
+                            ui.add_space(10.0);
+                            egui::Frame::new()
+                                .fill(t.pill_active_bg)
+                                .stroke(Stroke::new(1.0, t.accent))
+                                .corner_radius(6.0)
+                                .inner_margin(10.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(w - 16.0);
+                                    let mins = (secs / 60.0).floor() as i64;
+                                    let rem_s = (secs % 60.0).floor() as i64;
+                                    let time_fmt = if mins > 0 {
+                                        format!("{:02}m {:02}s", mins, rem_s)
+                                    } else {
+                                        format!("{:.1}s", secs)
+                                    };
+                                    ui.label(egui::RichText::new(format!("⚡ {} pausas detectadas • {} economizados!", count, time_fmt)).size(12.0).strong().color(t.accent));
+                                    ui.label(egui::RichText::new("Clique no botão abaixo para aparar a timeline mantendo todas as camadas 100% sincronizadas.").size(10.5).color(t.text_dim));
+                                });
+                        }
                     }
                 }
             }
@@ -695,6 +801,74 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("ai.cancel", json!({"job": job_id}));
                 }
             });
+        });
+    } else if app.ui.ai.active_tab == "Automation" && app.ui.ai.selected_tool == "timeline.silence" {
+        // Dedicated footer for Silence Trimming
+        footer_ui.horizontal(|ui| {
+            // Button 1: Analisar Silêncios (Preview / Non-destructive)
+            let btn_analyze = egui::Button::new(
+                egui::RichText::new("🔍 Analisar").size(12.0).color(t.text),
+            )
+            .fill(t.field_bg)
+            .stroke(Stroke::new(1.0, t.field_border))
+            .min_size(vec2(90.0, 36.0));
+
+            let analyze_resp = ui.add(btn_analyze);
+            auto.add("ai.silence.analyze", analyze_resp.rect, "Analisar Silêncios");
+            if analyze_resp.clicked() {
+                let clip_opt = active_clip.as_ref().map(|(c, _, _, _)| c.0);
+                let res = app.session.execute("timeline.silence", json!({
+                    "clip": clip_opt,
+                    "thresholdDb": app.ui.ai.silence_threshold_db,
+                    "minDuration": app.ui.ai.silence_min_duration,
+                    "padding": app.ui.ai.silence_padding,
+                    "allTracks": app.ui.ai.silence_all_tracks,
+                    "apply": false,
+                }));
+                match res {
+                    Ok(v) => {
+                        let count = v.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                        let secs = v.get("trimmedSeconds").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                        app.ui.ai.silence_last_stats = Some((count, secs));
+                        app.ui.status = format!("Análise concluída: {} pausas encontradas ({:.1}s de silêncio)", count, secs);
+                    }
+                    Err(e) => {
+                        app.ui.status = format!("Erro ao analisar: {e}");
+                    }
+                }
+            }
+
+            // Button 2: Cortar e Sincronizar Tudo (Primary CTA)
+            let btn_cut = egui::Button::new(
+                egui::RichText::new("✂️ Aparar e Sincronizar Tudo").size(12.5).color(Color32::WHITE),
+            )
+            .fill(t.accent)
+            .min_size(vec2(ui.available_width(), 36.0));
+
+            let cut_resp = ui.add(btn_cut);
+            auto.add("ai.silence.cut", cut_resp.rect, "Aparar Silêncios na Timeline");
+            if cut_resp.clicked() {
+                let clip_opt = active_clip.as_ref().map(|(c, _, _, _)| c.0);
+                let res = app.session.execute("timeline.silence", json!({
+                    "clip": clip_opt,
+                    "thresholdDb": app.ui.ai.silence_threshold_db,
+                    "minDuration": app.ui.ai.silence_min_duration,
+                    "padding": app.ui.ai.silence_padding,
+                    "allTracks": app.ui.ai.silence_all_tracks,
+                    "apply": true,
+                }));
+                match res {
+                    Ok(v) => {
+                        let count = v.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                        let secs = v.get("trimmedSeconds").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                        app.ui.ai.silence_last_stats = None;
+                        app.ui.status = format!("✂️ Sucesso! {} pausas aparadas em todas as camadas ({:.1}s economizados).", count, secs);
+                    }
+                    Err(e) => {
+                        app.ui.status = format!("Erro ao aparar silêncios: {e}");
+                    }
+                }
+            }
         });
     } else {
         // Idle footer: Primary run CTA button
