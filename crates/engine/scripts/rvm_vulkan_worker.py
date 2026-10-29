@@ -60,7 +60,7 @@ def run_worker(
         sys.exit(1)
 
     effective_duration = duration_sec if duration_sec and duration_sec > 0 else (st_duration if st_duration > 0 else 60.0)
-    total_expected_frames = int(effective_duration * target_fps)
+    total_expected_frames = int(round(effective_duration * target_fps))
 
     if resolution == "480p":
         inf_w, inf_h = 854, 480
@@ -80,13 +80,24 @@ def run_worker(
 
     # 2. FFmpeg Reader Pipe (CFR target_fps FPS)
     read_cmd = ["ffmpeg", "-v", "error"]
-    if start_time:
-        read_cmd += ["-ss", str(start_time)]
-    read_cmd += ["-i", input_video]
+    if start_time is not None:
+        try:
+            st_val = float(start_time)
+        except (ValueError, TypeError):
+            st_val = 0.0
+        if st_val > 5.0:
+            read_cmd += ["-ss", str(st_val - 3.0), "-i", input_video, "-ss", "3.0"]
+        elif st_val > 0.0:
+            read_cmd += ["-i", input_video, "-ss", str(st_val)]
+        else:
+            read_cmd += ["-i", input_video]
+    else:
+        read_cmd += ["-i", input_video]
+
     if duration_sec and duration_sec > 0:
         read_cmd += ["-t", str(duration_sec)]
 
-    filters = [f"fps={target_fps}"]
+    filters = [f"fps={target_fps}", "setpts=PTS-STARTPTS"]
     read_cmd += ["-vf", ",".join(filters)]
     read_cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     reader = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, bufsize=orig_w * orig_h * 3 * 8)
@@ -98,6 +109,7 @@ def run_worker(
         "-f", "rawvideo", "-pix_fmt", "bgra",
         "-s", f"{orig_w}x{orig_h}", "-r", str(target_fps),
         "-i", "-",
+        "-r", str(target_fps),
         "-c:v", "prores_ks", "-profile:v", "4",
         "-pix_fmt", "yuva444p12le",
         "-an", output_mov,
@@ -337,6 +349,7 @@ def run_worker(
         "type": "completed",
         "output_path": output_mov,
         "frames": final_frames,
+        "done": final_frames,
         "seconds": round(total_el, 2),
         "fps": round(final_fps, 1),
         "finished": True,
@@ -369,11 +382,21 @@ def run_preview_frame(
     orig_h = int(meta["streams"][0]["height"])
 
     # 2. Grab single frame at preview_time using ffmpeg
-    read_cmd = [
-        "ffmpeg", "-v", "error",
-        "-ss", str(max(preview_time, 0.0)),
-        "-i", input_video,
+    read_cmd = ["ffmpeg", "-v", "error"]
+    try:
+        pt = max(float(preview_time), 0.0)
+    except (ValueError, TypeError):
+        pt = 0.0
+    if pt > 5.0:
+        read_cmd += ["-ss", str(pt - 3.0), "-i", input_video, "-ss", "3.0"]
+    elif pt > 0.0:
+        read_cmd += ["-i", input_video, "-ss", str(pt)]
+    else:
+        read_cmd += ["-i", input_video]
+
+    read_cmd += [
         "-vframes", "1",
+        "-vf", "setpts=PTS-STARTPTS",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-"

@@ -194,7 +194,7 @@ pub fn parse_worker_line(line: &str, progress: &Arc<filmcraft_export::Progress>)
         progress.total.store(total, Ordering::Relaxed);
     }
 
-    if let Some(done) = v.get("done").and_then(Value::as_u64) {
+    if let Some(done) = v.get("done").or_else(|| v.get("frames")).and_then(Value::as_u64) {
         progress.done.store(done, Ordering::Relaxed);
     }
 
@@ -222,7 +222,8 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let mock_frames = u64_p(p, "mockFrames").unwrap_or(60).max(1);
     let wait = bool_p(p, "wait").unwrap_or(false);
     let auto_place = bool_p(p, "autoPlace").unwrap_or(true);
-    let fps = f64_p(p, "fps").unwrap_or(30.0);
+    let seq_fps = s.active_sequence().map(|q| q.settings.frame_rate.as_f64()).unwrap_or(30.0);
+    let fps = f64_p(p, "fps").unwrap_or(seq_fps);
     let res = str_p(p, "res").unwrap_or("480p").to_string();
 
     let (input_path, source_in_sec, duration_sec, output_path, detected_frames, is_mock) = if let Some(inp) = str_p(p, "input") {
@@ -234,7 +235,7 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
             let dir = pb.parent().unwrap_or(std::path::Path::new("."));
             dir.join(format!("{stem}_ai_matte.mov")).to_string_lossy().to_string()
         });
-        (inp.to_string(), start, dur, out, (dur * fps) as u64, mock)
+        (inp.to_string(), start, dur, out, (dur * fps).round() as u64, mock)
     } else if let Some(cid) = clip_id {
         let q = s.active_sequence().ok_or_else(|| bad("ai.run", "no active sequence"))?;
         let (_, it) = q.find_item(cid).ok_or_else(|| bad("ai.run", "selected clip not found in sequence"))?;
@@ -247,9 +248,9 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
                     let pb = std::path::PathBuf::from(path);
                     let stem = pb.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
                     let dir = pb.parent().unwrap_or(std::path::Path::new("."));
-                    dir.join(format!("{stem}_ai_matte.mov")).to_string_lossy().to_string()
+                    dir.join(format!("{stem}_ai_matte_clip{}.mov", cid.0)).to_string_lossy().to_string()
                 });
-                (path.clone(), start_sec, dur_sec, out, (dur_sec * fps) as u64, false)
+                (path.clone(), start_sec, dur_sec, out, (dur_sec * fps).round() as u64, false)
             }
             _ => {
                 // If it's a generator (demo footage) or mock requested, fall back to simulation
@@ -367,7 +368,7 @@ fn run_tool(s: &mut Session, p: &Value) -> Result<Value> {
             "-t", &format!("{duration_sec:.3}"),
             "--smoothing", &format!("{smoothing:.2}"),
             "--feather", &format!("{feather:.1}"),
-            "--fps", &format!("{fps:.1}"),
+            "--fps", &format!("{fps:.3}"),
             "--res", &res,
         ]);
         if !green_suppr {
@@ -526,23 +527,25 @@ fn apply_tool(s: &mut Session, p: &Value) -> Result<Value> {
     let item_id = items.first().and_then(Value::as_u64).ok_or_else(|| bad("ai.apply", "no item id from import"))?;
 
     // 2. Query timing and track from the original clip if present
-    let (start, source_in, duration, effects_to_copy) = if let Some(cid) = clip_id {
+    let (start, duration, effects_to_copy) = if let Some(cid) = clip_id {
         let q = s.active_sequence().ok_or_else(|| bad("ai.apply", "no active sequence"))?;
         let (_track_id, it) = q.find_item(cid).ok_or_else(|| bad("ai.apply", "original clip not found"))?;
-        (it.start, it.source_in, it.duration, it.effects.clone())
+        (it.start, it.duration, it.effects.clone())
     } else {
-        (s.playhead(), filmcraft_time::Tick::ZERO, filmcraft_time::Tick::from_seconds_f64(5.0), Vec::new())
+        (s.playhead(), filmcraft_time::Tick::from_seconds_f64(5.0), Vec::new())
     };
 
     // Always place on the top-most track above all video layers
     let target_track = str_p(p, "track").map(str::to_string).unwrap_or_else(|| "new".to_string());
 
-    // 3. Place clip on timeline
+    // 3. Place clip on timeline.
+    // NOTE: The processed matte movie already starts at 0.0s corresponding to the trimmed section,
+    // so `sourceIn` must be 0 to keep frame 0 aligned with `start`.
     let place_res = s.execute("timeline.place", json!({
         "item": item_id,
         "track": target_track,
         "time": start.0,
-        "sourceIn": source_in.0,
+        "sourceIn": 0,
         "duration": duration.0,
         "video": true,
         "audio": false,

@@ -130,6 +130,7 @@ fn ai_apply_imports_media_and_places_on_timeline() {
         let v2 = &q.video_tracks[1];
         assert_eq!(v2.items.len(), 1);
         assert_eq!(v2.items[0].item.0, res["importedItem"].as_u64().unwrap());
+        assert_eq!(v2.items[0].source_in, filmcraft_time::Tick::ZERO);
     }
 }
 
